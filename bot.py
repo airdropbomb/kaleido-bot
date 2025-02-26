@@ -88,13 +88,27 @@ class KaleidoMiningBot:
             }
         }
 
+        # Send request to API and get response
         response = self.retry_request(lambda: self.session.post(f"{API_URL}/update-balance", json=payload), "Balance Update")
+        
+        # Debug: Print raw API response to see what’s coming back
+        print(Fore.CYAN + f"[Debug Wallet {self.bot_index}] API Response: {response.text}")
 
-        if response and response.json().get("success"):
-            self.current_earnings["total"] += new_earnings
-            self.current_earnings["pending"] = 0 if final_update else new_earnings
-            self.save_session()
-            self.log_status()
+        # Check if response is valid and successful
+        if response and response.status_code == 200:
+            try:
+                response_json = response.json()
+                if response_json.get("success"):
+                    self.current_earnings["total"] += new_earnings
+                    self.current_earnings["pending"] = 0 if final_update else new_earnings
+                    self.save_session()
+                    self.log_status()
+                else:
+                    print(Fore.RED + f"[Wallet {self.bot_index}] Balance update failed! API returned: {response_json}")
+            except json.JSONDecodeError:
+                print(Fore.RED + f"[Wallet {self.bot_index}] Invalid JSON response from API: {response.text}")
+        else:
+            print(Fore.RED + f"[Wallet {self.bot_index}] Balance update failed! Status Code: {response.status_code if response else 'No response'}")
 
     def log_status(self):
         uptime = str(datetime.timedelta(seconds=int(time.time() - self.mining_state["startTime"])))
