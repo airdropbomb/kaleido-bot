@@ -1,190 +1,217 @@
-import threading
+import requests
 import time
 import json
-import datetime
-import requests
+import asyncio
 import os
 from colorama import Fore, Style, init
-from tabulate import tabulate
-from tqdm import tqdm
-import signal
+import random
 
+# Initialize colorama
 init(autoreset=True)
 
-API_URL = "https://kaleidofinance.xyz/api/testnet"
-
 class KaleidoMiningBot:
-    def __init__(self, wallet, bot_index):
+    def __init__(self, wallet, bot_index, proxy=None):
         self.wallet = wallet
         self.bot_index = bot_index
+        self.proxy = proxy
         self.current_earnings = {"total": 0, "pending": 0, "paid": 0}
-        self.mining_state = {"isActive": False, "startTime": None}
-        self.referral_bonus = 0
-        self.stats = {"hashrate": 75.5, "powerUsage": 120}
-        self.session_file = f"session_{wallet}.json"
-        self.session = requests.Session()
-
-    def load_session(self):
-        if os.path.exists(self.session_file):
-            with open(self.session_file, "r") as file:
-                session = json.load(file)
-                self.mining_state["startTime"] = session["startTime"]
-                self.current_earnings = session["earnings"]
-                self.referral_bonus = session.get("referralBonus", 0)
-                print(Fore.GREEN + f"[Wallet {self.bot_index}] Session loaded successfully.")
-                return True
-        return False
-
-    def save_session(self):
-        session_data = {
-            "startTime": self.mining_state["startTime"],
-            "earnings": self.current_earnings,
-            "referralBonus": self.referral_bonus,
+        self.mining_state = {
+            "is_active": False,
+            "worker": "quantum-rig-1",
+            "pool": "quantum-1",
+            "start_time": None
         }
-        with open(self.session_file, "w") as file:
-            json.dump(session_data, file, indent=2)
+        self.referral_bonus = 0
+        self.stats = {
+            "hashrate": 75.5,
+            "shares": {"accepted": 0, "rejected": 0},
+            "efficiency": 1.4,
+            "power_usage": 120
+        }
+        self.api = requests.Session()
+        self.api.headers.update({
+            "Content-Type": "application/json",
+            "Referer": "https://kaleidofinance.xyz/testnet",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"
+        })
+        if self.proxy:
+            self.api.proxies = {
+                "http": self.proxy,
+                "https": self.proxy
+            }
+        self.base_url = "https://kaleidofinance.xyz/api/testnet"
 
-    def retry_request(self, request_fn, operation_name):
-        while True:
+    async def initialize(self):
+        try:
+            if self.proxy:
+                print(f"{Fore.YELLOW}[ℹ️] Account [{self.bot_index}] Using proxy: {self.proxy}{Style.RESET_ALL}")
+            reg_response = await self.retry_request(
+                lambda: self.api.get(f"{self.base_url}/check-registration?wallet={self.wallet}"),
+                "Registration check"
+            )
+
+            if not reg_response.json().get("isRegistered", False):
+                raise Exception("Wallet not registered")
+
+            self.referral_bonus = reg_response.json().get("userData", {}).get("referralBonus", 0)
+            self.current_earnings = {
+                "total": self.referral_bonus,
+                "pending": 0,
+                "paid": 0
+            }
+            self.mining_state["start_time"] = int(time.time() * 1000)
+            self.mining_state["is_active"] = True
+
+            print(f"{Fore.GREEN}[✅] Account [{self.bot_index}] Mining initialized successfully{Style.RESET_ALL}")
+            await self.start_mining_loop()
+
+        except Exception as e:
+            print(f"{Fore.RED}[❌] Account [{self.bot_index}] Initialization failed: {e}{Style.RESET_ALL}")
+
+    async def retry_request(self, request_fn, operation_name, retries=3):
+        for i in range(retries):
             try:
-                return request_fn()
-            except requests.RequestException as e:
-                if isinstance(e, requests.exceptions.SSLError) or isinstance(e, requests.exceptions.ConnectionError):
-                    print(Fore.RED + f"[{operation_name}] Failed connected. Please wait to connect again. Error: {e}")
+                response = request_fn()
+                if response.status_code == 200:
+                    return response
                 else:
-                    print(Fore.YELLOW + f"[{operation_name}] Error occurred: {e}. Retrying...")
-                time.sleep(1)
-
-    def initialize(self):
-        print(Fore.CYAN + f"\n🚀 [Wallet {self.bot_index}] Initializing mining...")
-        response = self.retry_request(lambda: self.session.get(f"{API_URL}/check-registration?wallet={self.wallet}"), "Registration Check")
-
-        if not response or not response.json().get("isRegistered"):
-            print(Fore.RED + f"[Wallet {self.bot_index}] Wallet not registered!")
-            return
-
-        if not self.load_session():
-            user_data = response.json()["userData"]
-            self.referral_bonus = user_data.get("referralBonus", 0)
-            self.current_earnings["total"] = self.referral_bonus
-            self.mining_state["startTime"] = time.time()
-
-        self.mining_state["isActive"] = True
-        print(Fore.GREEN + f"[Wallet {self.bot_index}] Mining started!")
-        self.start_mining_loop()
+                    raise Exception(f"HTTP {response.status_code}: {response.text}")
+            except Exception as e:
+                if i == retries - 1:
+                    raise e
+                print(f"{Fore.YELLOW}[{operation_name}] Retrying ({i + 1}/{retries})...{Style.RESET_ALL}")
+                await asyncio.sleep(2 * (i + 1))
 
     def calculate_earnings(self):
-        time_elapsed = time.time() - self.mining_state["startTime"]
+        time_elapsed = (int(time.time() * 1000) - self.mining_state["start_time"]) / 1000
         return (self.stats["hashrate"] * time_elapsed * 0.0001) * (1 + self.referral_bonus)
 
-    def update_balance(self, final_update=False):
-        new_earnings = self.calculate_earnings()
-        payload = {
-            "wallet": self.wallet,
-            "earnings": {
-                "total": self.current_earnings["total"] + new_earnings,
-                "pending": 0 if final_update else new_earnings,
-                "paid": self.current_earnings["paid"] + new_earnings if final_update else self.current_earnings["paid"],
+    async def update_balance(self):
+        try:
+            new_earnings = self.calculate_earnings()
+            payload = {
+                "wallet": self.wallet,
+                "earnings": {
+                    "total": self.current_earnings["total"] + new_earnings,
+                    "session": new_earnings,
+                    "lastUpdate": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+                }
             }
-        }
 
-        # Send request to API and get response
-        response = self.retry_request(lambda: self.session.post(f"{API_URL}/update-balance", json=payload), "Balance Update")
-        
-        # Debug: Print raw API response to see what’s coming back
-        print(Fore.CYAN + f"[Debug Wallet {self.bot_index}] API Response: {response.text}")
+            response = await self.retry_request(
+                lambda: self.api.post(f"{self.base_url}/update-balance", json=payload),
+                "Balance update"
+            )
 
-        # Check if response is valid and successful
-        if response and response.status_code == 200:
-            try:
-                response_json = response.json()
-                if response_json.get("success"):
-                    self.current_earnings["total"] += new_earnings
-                    self.current_earnings["pending"] = 0 if final_update else new_earnings
-                    self.save_session()
-                    self.log_status()
-                else:
-                    print(Fore.RED + f"[Wallet {self.bot_index}] Balance update failed! API returned: {response_json}")
-            except json.JSONDecodeError:
-                print(Fore.RED + f"[Wallet {self.bot_index}] Invalid JSON response from API: {response.text}")
-        else:
-            print(Fore.RED + f"[Wallet {self.bot_index}] Balance update failed! Status Code: {response.status_code if response else 'No response'}")
+            if response.json().get("success", False):
+                self.current_earnings["total"] = response.json().get("balance", 0)
+                print(f"{Fore.CYAN}[➡️] Account [{self.bot_index}] Balance updated: {Fore.GREEN}{self.current_earnings['total']}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}[❌] Account [{self.bot_index}] Failed to update balance: {response.text}{Style.RESET_ALL}")
 
-    def log_status(self):
-        uptime = str(datetime.timedelta(seconds=int(time.time() - self.mining_state["startTime"])))
+        except Exception as e:
+            print(f"{Fore.RED}[❌] Account [{self.bot_index}] Update failed: {e}{Style.RESET_ALL}")
 
-        table_data = [
-            ["🔹 Wallet", f"{Fore.CYAN}{self.wallet}{Style.RESET_ALL}"],
-            ["⏳ Uptime", f"{Fore.YELLOW}{uptime}{Style.RESET_ALL}"],
-            ["⚡ Hashrate", f"{Fore.GREEN}{self.stats['hashrate']} MH/s{Style.RESET_ALL}"],
-            ["💰 Total Earned", f"{Fore.CYAN}{self.current_earnings['total']:.8f} KLDO{Style.RESET_ALL}"],
-            ["⌛ Pending", f"{Fore.YELLOW}{self.current_earnings['pending']:.8f} KLDO{Style.RESET_ALL}"],
-            ["✅ Paid", f"{Fore.GREEN}{self.current_earnings['paid']:.8f} KLDO{Style.RESET_ALL}"],
-            ["🎁 Referral Bonus", f"{Fore.MAGENTA}{self.referral_bonus * 100:.1f}%{Style.RESET_ALL}"],
-        ]
+    async def start_mining_loop(self):
+        while self.mining_state["is_active"]:
+            await self.update_balance()
+            print(f"{Fore.MAGENTA}================================================={Style.RESET_ALL}")
+            await asyncio.sleep(30)
 
-        print(Fore.YELLOW + "\n📊 === [ Mining Status ] ===")
-        print(tabulate(table_data, tablefmt="fancy_grid"))
-
-    def start_mining_loop(self):
-        while self.mining_state["isActive"]:
-            for _ in tqdm(range(30), desc=f"⛏️  [Mining Wallet {self.bot_index}]", bar_format="{l_bar}{bar} {remaining}"):
-                time.sleep(1)
-            self.update_balance()
-
-    def stop(self):
-        self.mining_state["isActive"] = False
-        self.update_balance(final_update=True)
-        self.save_session()
-        print(Fore.RED + f"[Wallet {self.bot_index}] Mining stopped.")
+    async def stop(self):
+        self.mining_state["is_active"] = False
+        await self.update_balance()
         return self.current_earnings["paid"]
+
 
 class MiningCoordinator:
     def __init__(self):
         self.bots = []
+        self.total_paid = 0
         self.is_running = False
+        self.proxies = []
 
-    def load_wallets(self):
-        if not os.path.exists("wallets.txt"):
-            print(Fore.RED + "❌ No wallets.txt found!")
+    async def load_wallets(self):
+        try:
+            with open("wallets.txt", "r") as file:
+                return [line.strip() for line in file if line.startswith("0x")]
+        except Exception as e:
+            print(f"{Fore.RED}Error loading wallets: {e}{Style.RESET_ALL}")
             return []
-        with open("wallets.txt", "r") as file:
-            return [line.strip() for line in file.readlines() if line.startswith("0x")]
 
-    def start(self):
+    async def load_proxies(self):
+        try:
+            with open("proxy.txt", "r") as file:
+                self.proxies = [line.strip() for line in file if line.strip()]
+            if not self.proxies:
+                print(f"{Fore.YELLOW}[ℹ️] No proxies found in proxy.txt, running without proxies{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.CYAN}[ℹ️] Loaded {len(self.proxies)} proxies from proxy.txt{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}Error loading proxies: {e}{Style.RESET_ALL}")
+            self.proxies = []
+
+    async def start(self):
         if self.is_running:
-            print(Fore.YELLOW + "⚠️  Mining coordinator is already running!")
+            print(f"{Fore.YELLOW}Mining coordinator is already running{Style.RESET_ALL}")
             return
 
         self.is_running = True
-        print(Fore.BLUE + "\n🚀 Starting mining...")
 
-        wallets = self.load_wallets()
+        os.system("cls" if os.name == "nt" else "clear")
+        self.display_banner()
+
+        wallets = await self.load_wallets()
+        await self.load_proxies()
+
         if not wallets:
-            print(Fore.RED + "❌ No valid wallets found!")
+            print(f"{Fore.RED}No valid wallets found in wallets.txt{Style.RESET_ALL}")
             return
 
-        print(Fore.GREEN + f"✅ Loaded {len(wallets)} wallets\n")
+        print(f"{Fore.CYAN}[🕵️‍♀️] Total account : {len(wallets)}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}================================================={Style.RESET_ALL}")
 
-        self.bots = [KaleidoMiningBot(wallet, i + 1) for i, wallet in enumerate(wallets)]
+        # Proxy တွေကို wallet တစ်ခုချင်းစီအတွက် assign လုပ်တယ်
+        self.bots = []
+        for i, wallet in enumerate(wallets):
+            # Proxy ရှိရင် random တစ်ခု ရွေးမယ်၊ မရှိရင် None
+            proxy = random.choice(self.proxies) if self.proxies else None
+            self.bots.append(KaleidoMiningBot(wallet, i + 1, proxy=proxy))
 
-        threads = []
-        for bot in self.bots:
-            thread = threading.Thread(target=bot.initialize)
-            threads.append(thread)
-            thread.start()
+        await asyncio.gather(*[bot.initialize() for bot in self.bots])
 
-        for thread in threads:
-            thread.join()
+        import signal
+        signal.signal(signal.SIGINT, self.handle_shutdown)
 
-        signal.signal(signal.SIGINT, self.shutdown)
+    def display_banner(self):
+        BANNER = f"""
+{Fore.CYAN}
+       █████╗ ██████╗ ██████╗     ███╗   ██╗ ██████╗ ██████╗ ███████╗
+      ██╔══██╗██╔══██╗██╔══██╗    ████╗  ██║██╔═══██╗██╔══██╗██╔════╝
+      ███████║██║  ██║██████╔╝    ██╔██╗ ██║██║   ██║██║  ██║█████╗  
+      ██╔══██║██║  ██║██╔══██╗    ██║╚██╗██║██║   ██║██║  ██║██╔══╝  
+      ██║  ██║██████╔╝██████╔╝    ██║ ╚████║╚██████╔╝██████╔╝███████╗
+      ╚═╝  ╚═╝╚═════╝ ╚═════╝     ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝ 
+{Style.RESET_ALL}
+Bot Auto Mining Kaleido 
+{Fore.YELLOW}Telegram : https://t.me/airdropbombnode{Style.RESET_ALL}
+        """
+        print(BANNER)
 
-    def shutdown(self, sig, frame):
-        print(Fore.YELLOW + "\n⏳ Shutting down miners...")
-        total_paid = sum(bot.stop() for bot in self.bots)
-        print(Fore.GREEN + f"\n💰 Total Paid: {total_paid:.8f} KLDO\n")
+    async def handle_shutdown(self, signum, frame):
+        print(f"\n{Fore.YELLOW}Shutting down miners...{Style.RESET_ALL}")
+        self.total_paid = sum([await bot.stop() for bot in self.bots])
+        print(f"""
+{Fore.MAGENTA}=================================================
+   💰 Final Summary
+=================================================
+{Fore.CYAN}Total Wallets: {len(self.bots)}
+{Fore.GREEN}Total Paid: {self.total_paid:.8f} KLDO
+{Fore.MAGENTA}================================================={Style.RESET_ALL}
+        """)
         exit()
+
 
 if __name__ == "__main__":
     coordinator = MiningCoordinator()
-    coordinator.start()
+    asyncio.run(coordinator.start())
