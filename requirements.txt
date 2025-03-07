@@ -1,5 +1,3 @@
-shareithub
 requests
 colorama
-tabulate
-tqdm
+asyncio
